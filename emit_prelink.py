@@ -71,7 +71,7 @@ def pc_relative_target(word, pc):
     return None
 
 
-def instruction_inventory(original_data, parent, modules):
+def instruction_inventory(original_data, parent, modules, inline_data=()):
     extents = [s for module in modules.values() for s in module['segments'] if s['size'] and s['name'] != '__LINKEDIT']
     literal_ranges, instruction_count = [], 0
     for identifier, module in modules.items():
@@ -86,7 +86,7 @@ def instruction_inventory(original_data, parent, modules):
                     (bytes.fromhex('982f8a42'), 256, SHA256_K_DIGEST, 0),
                     (bytes.fromhex('0001000100010001'), 528, VECTOR_REPEAT_DIGEST, 64),
                     (bytes(range(32, 24, -1)), 40, ADLER32_VECTOR_DIGEST, 0),
-                    *((bytes.fromhex(prefix), size, digest, 0) for prefix, size, digest in MATH_LITERAL_POOLS)):
+                    *((bytes.fromhex(prefix), size, digest, 0) for prefix, size, digest in (*MATH_LITERAL_POOLS, *inline_data))):
                 search = 0
                 while (search := blob.find(prefix, search)) >= 0:
                     start = search - prefix_offset
@@ -114,7 +114,7 @@ def instruction_inventory(original_data, parent, modules):
             'register_dataflow_qualified': False}
 
 
-def emit(native_data, original_data, roots, slide, early_security_init=None):
+def emit(native_data, original_data, roots, slide, early_security_init=None, inline_data=()):
     report = plan(native_data, original_data, roots, slide)
     native, original = macho(native_data), macho(original_data)
     marker = [address for address, names in exports(native_data, native).items()
@@ -133,7 +133,7 @@ def emit(native_data, original_data, roots, slide, early_security_init=None):
     for identifier in report['components']:
         va = entries[identifier]['_PrelinkExecutableLoadAddr']
         modules[identifier] = macho(original_data, backed_offset(parent, va, 32, len(original_data)))
-    report.update(instruction_inventory(original_data, parent, modules))
+    report.update(instruction_inventory(original_data, parent, modules, inline_data))
     early_security_init = early_security_init or {}
     if early_security_init:
         markers = [address for address, names in exports(native_data, native).items()
@@ -315,14 +315,26 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--early-security-init', action='append', default=[], metavar='BUNDLE=ORIGINAL_VA',
                         help='Explicit original void(void) policy initializer, called before lockdown; requires source ABI')
+    parser.add_argument('--inline-data', action='append', default=[], metavar='PREFIX:SIZE:SHA256',
+                        help='Another known data pool inside component code (another kernelcache): its first bytes in hex, '
+                             'its size and the SHA-256 of all of it; like the built-in pools, only a complete match is skipped')
     args = parser.parse_args()
+    inline_data = []
+    for request in args.inline_data:
+        prefix, size, digest = (request.split(':') + ['', ''])[:3]
+        try:
+            if len(bytes.fromhex(prefix)) < 8 or int(size, 0) % 4 or int(size, 0) < len(bytes.fromhex(prefix)) or len(bytes.fromhex(digest)) != 32:
+                raise ValueError
+        except ValueError:
+            parser.error(f'--inline-data needs PREFIX:SIZE:SHA256 with at least 8 prefix bytes and a word-sized pool: {request}')
+        inline_data.append((prefix, int(size, 0), digest))
     initializers = {}
     for request in args.early_security_init:
         identifier, separator, address = request.partition('=')
         if not separator or not identifier or identifier in initializers:
             parser.error('Use one BUNDLE=ORIGINAL_VA initializer per module')
         initializers[identifier] = int(address, 0)
-    image, report = emit(args.kernel.read_bytes(), args.prelinked.read_bytes(), args.root, args.slide, initializers)
+    image, report = emit(args.kernel.read_bytes(), args.prelinked.read_bytes(), args.root, args.slide, initializers, inline_data)
     if args.output.exists():
         raise SystemExit('Refuse to overwrite an existing candidate')
     args.output.parent.mkdir(parents=True, exist_ok=True)

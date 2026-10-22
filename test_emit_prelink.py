@@ -183,6 +183,22 @@ class EmitTests(unittest.TestCase):
             with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'External PC-relative'):
                 emit(native, bad, ['test.component'], 0x4000)
 
+    def test_given_inline_data_pool_preserved(self):
+        native, original = images(); original = bytearray(original)
+        # A pool of words that decode as a branch out of the collection, as a given --inline-data pool (another kernelcache).
+        table = struct.pack('<I', 0x7f800000) + struct.pack('<I', 0x14002000) * 7
+        pool = (table[:8].hex(), len(table), hashlib.sha256(table).hexdigest())
+        original[0x2100:0x2100 + len(table)] = table
+        with self.assertRaisesRegex(ValueError, 'External PC-relative'):
+            emit(native, original, ['test.component'], 0x4000)
+        output, report = emit(native, original, ['test.component'], 0x4000, inline_data=[pool])
+        self.assertEqual(report['known_inline_data'], [dict(module='test.component', va=0x3100, size=len(table), sha256=pool[2])])
+        at = backed_offset(macho(output)['segments'], 0x7100, len(table), len(output))
+        self.assertEqual(output[at:at + len(table)], table)
+        bad = bytearray(original); bad[0x2100 + 12] ^= 1
+        with self.assertRaisesRegex(ValueError, 'External PC-relative'):
+            emit(native, bad, ['test.component'], 0x4000, inline_data=[pool])
+
     def test_refuse_missing_sparse_index_abi(self):
         native, original = images()
         native = native.replace(b'_kalloc_sparse_prelink_index_version', b'_unsupported_prelink_index_version__')
